@@ -1,0 +1,501 @@
+#!/bin/bash
+# odbc-dsn - manage PostgreSQL ODBC DSNs for Excel for Mac.
+#
+# Run without arguments for the interactive menu, or use a subcommand:
+#
+#   odbc-dsn list
+#   odbc-dsn show   <name>
+#   odbc-dsn add    <name> --host H --database D --user U [--port 5432]
+#                          [--sslmode disable] [--charset MACINTOSH]
+#   odbc-dsn edit   <name> [--host H] [--port P] [--database D] [--user U]
+#                          [--sslmode M] [--charset C] [--password]
+#   odbc-dsn rename <old> <new>
+#   odbc-dsn rm     <name> [--yes]
+#   odbc-dsn test   <name>
+#
+# Passwords are read hidden from the terminal, or from ODBC_DSN_PASSWORD.
+#
+# DSNs live in ~/Library/ODBC/odbc.ini (override with ODBC_DSN_INI). For
+# sandboxed Excel that file is a hard link to its container copy, so every
+# write rewrites the same file in place (never a rename) and a timestamped
+# backup is taken first.
+set -euo pipefail
+
+INI=${ODBC_DSN_INI:-$HOME/Library/ODBC/odbc.ini}
+DRIVER=/Library/ODBC/psqlodbc.bundle/Contents/MacOS/psqlodbcw.so
+DRIVER_NAME=psql
+IODBC=/Library/Frameworks/iODBC.framework/Versions/3.52/iODBC
+SOURCES="ODBC Data Sources"
+
+DEFAULT_PORT=5432
+DEFAULT_SSLMODE=disable
+DEFAULT_CHARSET=MACINTOSH
+
+err() { printf 'error: %s\n' "$*" >&2; }
+
+# ---------------------------------------------------------------- ini access
+# Keys are matched case-insensitively, like ODBC does. Values travel through
+# the environment, never awk -v, so backslashes in passwords stay verbatim.
+
+ini_sections() {
+  [[ -f $INI ]] || return 0
+  awk -v skip="$SOURCES" '
+    /^\[.*\][ \t]*$/ { s = $0; sub(/^\[/, "", s); sub(/\][ \t]*$/, "", s); if (s != skip) print s }' "$INI"
+}
+
+ini_exists() {
+  [[ -f $INI ]] && grep -qxF -- "[$1]" "$INI"
+}
+
+ini_get() {
+  [[ -f $INI ]] || return 0
+  SEC="[$1]" KEY="$2" awk '
+    /^\[/ { insec = ($0 == ENVIRON["SEC"]); next }
+    insec && index($0, "=") {
+      k = substr($0, 1, index($0, "=") - 1); gsub(/^[ \t]+|[ \t]+$/, "", k)
+      if (tolower(k) == tolower(ENVIRON["KEY"])) {
+        v = substr($0, index($0, "=") + 1); gsub(/^[ \t]+|[ \t]+$/, "", v); print v; exit
+      }
+    }' "$INI"
+}
+
+# Filters stdin to stdout: set KEY in SEC, replacing the first occurrence and
+# dropping duplicates, or appending it after the section's last entry.
+ini_filter_set() {
+  SEC="[$1]" KEY="$2" VAL="$3" awk '
+    function line() { return ENVIRON["KEY"] " = " ENVIRON["VAL"] }
+    function flush_blanks(   i) { for (i = 1; i <= nb; i++) print blank[i]; nb = 0 }
+    /^\[/ {
+      if (insec && !done) { print line(); done = 1 }
+      flush_blanks(); insec = ($0 == ENVIRON["SEC"]); print; next
+    }
+    insec && /^[ \t]*$/ { blank[++nb] = $0; next }
+    {
+      flush_blanks()
+      if (insec && index($0, "=")) {
+        k = substr($0, 1, index($0, "=") - 1); gsub(/^[ \t]+|[ \t]+$/, "", k)
+        if (tolower(k) == tolower(ENVIRON["KEY"])) { if (!done) { print line(); done = 1 }; next }
+      }
+      print
+    }
+    END { if (insec && !done) print line(); flush_blanks() }'
+}
+
+ini_filter_del_key() {
+  SEC="[$1]" KEY="$2" awk '
+    /^\[/ { insec = ($0 == ENVIRON["SEC"]) }
+    insec && index($0, "=") {
+      k = substr($0, 1, index($0, "=") - 1); gsub(/^[ \t]+|[ \t]+$/, "", k)
+      if (tolower(k) == tolower(ENVIRON["KEY"])) next
+    }
+    { print }'
+}
+
+ini_filter_del_section() {
+  SEC="[$1]" awk '/^\[/ { skip = ($0 == ENVIRON["SEC"]) } !skip { print }' | cat -s
+}
+
+ini_filter_rename_section() {
+  OLD="[$1]" NEW="[$2]" awk '{ if ($0 == ENVIRON["OLD"]) print ENVIRON["NEW"]; else print }'
+}
+
+ini_filter_add_section() {
+  SEC="[$1]" awk '
+    { print; last = $0 }
+    END { if (NR && last != "") print ""; print ENVIRON["SEC"] }'
+}
+
+ini_filter_ensure_sources() {
+  SRC="[$SOURCES]" awk '
+    { lines[NR] = $0; if ($0 == ENVIRON["SRC"]) found = 1 }
+    END {
+      if (!found) { print ENVIRON["SRC"]; print "" }
+      for (i = 1; i <= NR; i++) print lines[i]
+    }'
+}
+
+# Commit stdin as the new ini: back up, then rewrite the SAME inode so the
+# hard link Excel reads keeps pointing at the current content.
+ini_commit() {
+  local tmp
+  tmp=$(mktemp "${TMPDIR:-/tmp}/odbc-dsn.XXXXXX")
+  chmod 600 "$tmp"
+  cat > "$tmp"
+  mkdir -p "$(dirname "$INI")"
+  if [[ -f $INI ]]; then
+    cp -p "$INI" "$INI.bak-$(date +%Y%m%d-%H%M%S)"
+  fi
+  cat "$tmp" > "$INI"
+  rm -f "$tmp"
+  chmod 600 "$INI"   # it holds passwords
+}
+
+ini_read() { [[ -f $INI ]] && cat "$INI" || true; }
+
+# --------------------------------------------------------------- validation
+
+valid_name() {
+  [[ $1 =~ ^[A-Za-z0-9_.-]+$ ]] || { err "Invalid DSN name '$1' (use letters, digits, '_', '-', '.')"; return 1; }
+}
+
+valid_port() {
+  [[ $1 =~ ^[0-9]+$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 )) || { err "Invalid port '$1'"; return 1; }
+}
+
+no_newline() {
+  [[ $2 != *$'\n'* ]] || { err "$1 cannot contain a line break"; return 1; }
+}
+
+need_dsn() {
+  ini_exists "$1" || { err "DSN '$1' does not exist"; return 1; }
+}
+
+need_free() {
+  ! ini_exists "$1" || { err "DSN '$1' already exists"; return 1; }
+}
+
+read_password() {
+  if [[ -n ${ODBC_DSN_PASSWORD+x} ]]; then
+    PASSWORD=$ODBC_DSN_PASSWORD
+  elif [[ -t 0 ]]; then
+    printf 'Password: ' >&2
+    IFS= read -rs PASSWORD; echo >&2
+  else
+    err "A password is required: run in a terminal or set ODBC_DSN_PASSWORD"
+    return 1
+  fi
+}
+
+# ----------------------------------------------------------------- commands
+
+cmd_list() {
+  local name found=0
+  [[ -f $DRIVER ]] || echo "warning: driver not installed at $DRIVER" >&2
+  printf '%-22s %-32s %-22s %-14s %s\n' NAME SERVER DATABASE USER CHARSET
+  while IFS= read -r name; do
+    found=1
+    printf '%-22s %-32s %-22s %-14s %s\n' "$name" \
+      "$(ini_get "$name" Servername):$(ini_get "$name" Port)" \
+      "$(ini_get "$name" Database)" "$(ini_get "$name" Username)" \
+      "$(ini_get "$name" AnsiCharset)"
+  done < <(ini_sections)
+  (( found )) || echo "(no DSNs yet)"
+}
+
+cmd_show() {
+  local name=${1:-} key value
+  [[ -n $name ]] || { err "Usage: odbc-dsn show <name>"; return 1; }
+  need_dsn "$name" || return 1
+  echo "[$name]"
+  SEC="[$name]" awk '
+    /^\[/ { insec = ($0 == ENVIRON["SEC"]); next }
+    insec && index($0, "=") { print }' "$INI" |
+  while IFS= read -r line; do
+    key=${line%%=*}; key=${key%"${key##*[![:space:]]}"}
+    value=${line#*=}; value=${value#"${value%%[![:space:]]*}"}
+    [[ $(tr '[:upper:]' '[:lower:]' <<< "$key") == password ]] && value="********"
+    printf '  %-12s %s\n' "$key" "$value"
+  done
+}
+
+# Parses --flag value pairs into OPT_* variables. --password takes no value.
+parse_opts() {
+  OPT_HOST= OPT_PORT= OPT_DB= OPT_USER= OPT_SSLMODE= OPT_CHARSET= OPT_PASSWORD=0
+  while (( $# )); do
+    case $1 in
+      --host|--port|--database|--user|--sslmode|--charset)
+        [[ $# -ge 2 ]] || { err "$1 needs a value"; return 1; }
+        case $1 in
+          --host) OPT_HOST=$2 ;; --port) OPT_PORT=$2 ;; --database) OPT_DB=$2 ;;
+          --user) OPT_USER=$2 ;; --sslmode) OPT_SSLMODE=$2 ;; --charset) OPT_CHARSET=$2 ;;
+        esac
+        shift 2 ;;
+      --password) OPT_PASSWORD=1; shift ;;
+      *) err "Unknown option: $1"; return 1 ;;
+    esac
+  done
+}
+
+cmd_add() {
+  local name=${1:-} key value ini
+  [[ -n $name ]] || { err "Usage: odbc-dsn add <name> --host H --database D --user U"; return 1; }
+  shift
+  parse_opts "$@" || return 1
+  valid_name "$name" || return 1
+  need_free "$name" || return 1
+  [[ -n $OPT_HOST ]] || { err "--host is required"; return 1; }
+  [[ -n $OPT_DB ]] || { err "--database is required"; return 1; }
+  [[ -n $OPT_USER ]] || { err "--user is required"; return 1; }
+  : "${OPT_PORT:=$DEFAULT_PORT}" "${OPT_SSLMODE:=$DEFAULT_SSLMODE}" "${OPT_CHARSET:=$DEFAULT_CHARSET}"
+  valid_port "$OPT_PORT" || return 1
+  read_password || return 1
+  for value in "$OPT_HOST" "$OPT_DB" "$OPT_USER" "$OPT_SSLMODE" "$OPT_CHARSET" "$PASSWORD"; do
+    no_newline "A value" "$value" || return 1
+  done
+
+  ini=$(ini_read | ini_filter_ensure_sources | ini_filter_set "$SOURCES" "$name" "$DRIVER_NAME" |
+        ini_filter_add_section "$name")
+  while IFS='|' read -r key value; do
+    ini=$(printf '%s\n' "$ini" | ini_filter_set "$name" "$key" "$value")
+  done <<EOF
+Driver|$DRIVER
+Servername|$OPT_HOST
+Port|$OPT_PORT
+Database|$OPT_DB
+Username|$OPT_USER
+SSLmode|$OPT_SSLMODE
+AnsiCharset|$OPT_CHARSET
+EOF
+  # The password may contain '|', so it is set on its own.
+  printf '%s\n' "$ini" | ini_filter_set "$name" Password "$PASSWORD" | ini_commit
+  echo "Created DSN '$name'"
+}
+
+cmd_edit() {
+  local name=${1:-} ini changed=0
+  [[ -n $name ]] || { err "Usage: odbc-dsn edit <name> [--host H] ..."; return 1; }
+  shift
+  parse_opts "$@" || return 1
+  need_dsn "$name" || return 1
+  [[ -z $OPT_PORT ]] || valid_port "$OPT_PORT" || return 1
+  if (( OPT_PASSWORD )); then read_password || return 1; fi
+
+  ini=$(ini_read)
+  set_if() {
+    [[ -n $2 ]] || return 0
+    no_newline "$1" "$2" || return 1
+    ini=$(printf '%s\n' "$ini" | ini_filter_set "$name" "$1" "$2"); changed=1
+  }
+  set_if Servername "$OPT_HOST" && set_if Port "$OPT_PORT" && set_if Database "$OPT_DB" &&
+    set_if Username "$OPT_USER" && set_if SSLmode "$OPT_SSLMODE" &&
+    set_if AnsiCharset "$OPT_CHARSET" || return 1
+  if (( OPT_PASSWORD )); then set_if Password "$PASSWORD" || return 1; fi
+  (( changed )) || { echo "Nothing to change"; return 0; }
+  printf '%s\n' "$ini" | ini_commit
+  echo "Updated DSN '$name'"
+}
+
+cmd_rename() {
+  local old=${1:-} new=${2:-} driver
+  [[ -n $old && -n $new ]] || { err "Usage: odbc-dsn rename <old> <new>"; return 1; }
+  need_dsn "$old" || return 1
+  valid_name "$new" || return 1
+  need_free "$new" || return 1
+  driver=$(ini_get "$SOURCES" "$old"); driver=${driver:-$DRIVER_NAME}
+  ini_read | ini_filter_rename_section "$old" "$new" | ini_filter_ensure_sources |
+    ini_filter_del_key "$SOURCES" "$old" | ini_filter_set "$SOURCES" "$new" "$driver" | ini_commit
+  echo "Renamed DSN '$old' to '$new'"
+  echo "Excel workbooks connected to '$old' must be pointed at '$new'."
+}
+
+cmd_rm() {
+  local name=${1:-} yes=${2:-} answer
+  [[ -n $name ]] || { err "Usage: odbc-dsn rm <name> [--yes]"; return 1; }
+  need_dsn "$name" || return 1
+  if [[ $yes != --yes ]]; then
+    printf "Delete DSN '%s'? [y/N] " "$name" >&2
+    read -r answer || answer=
+    [[ $answer == [yY]* ]] || { echo "Cancelled"; return 0; }
+  fi
+  ini_read | ini_filter_del_section "$name" | ini_filter_del_key "$SOURCES" "$name" | ini_commit
+  echo "Deleted DSN '$name'"
+}
+
+# Connects through the same iODBC framework Excel uses.
+cmd_test() {
+  local name=${1:-}
+  [[ -n $name ]] || { err "Usage: odbc-dsn test <name>"; return 1; }
+  need_dsn "$name" || return 1
+  [[ -f $IODBC ]] || { err "iODBC framework not found at $IODBC"; return 1; }
+  ODBCINI=$INI python3 -I - "$IODBC" "$name" <<'PY'
+import ctypes, sys
+dm = ctypes.CDLL(sys.argv[1])
+env, dbc, st = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p()
+dm.SQLAllocHandle(1, None, ctypes.byref(env))
+dm.SQLSetEnvAttr(env, 200, ctypes.c_void_p(3), 0)
+dm.SQLAllocHandle(2, env, ctypes.byref(dbc))
+conn = "DSN=%s;pqopt={connect_timeout=10}" % sys.argv[2]
+r = dm.SQLDriverConnectW(dbc, None, ctypes.c_wchar_p(conn), len(conn), None, 0, None, 0)
+if r not in (0, 1):
+    state, msg = ctypes.create_unicode_buffer(6), ctypes.create_unicode_buffer(1024)
+    native, length = ctypes.c_int(), ctypes.c_short()
+    dm.SQLGetDiagRecW(2, dbc, 1, state, ctypes.byref(native), msg, 1024, ctypes.byref(length))
+    detail = " ".join(msg.value.split()) or "no diagnostic (is the driver installed?)"
+    print("Connection failed: [%s] %s" % (state.value, detail))
+    sys.exit(1)
+q = "select version()"
+dm.SQLAllocHandle(3, dbc, ctypes.byref(st))
+dm.SQLExecDirectW(st, ctypes.c_wchar_p(q), len(q))
+dm.SQLFetch(st)
+buf, ind = ctypes.create_unicode_buffer(512), ctypes.c_ssize_t()
+dm.SQLGetData(st, 1, -8, buf, ctypes.sizeof(buf), ctypes.byref(ind))
+print("Connected: %s" % buf.value.split(" on ")[0])
+dm.SQLDisconnect(dbc)
+PY
+}
+
+# --------------------------------------------------------- interactive menu
+
+if [[ -t 1 ]]; then
+  BOLD=$'\033[1m' DIM=$'\033[2m' CYAN=$'\033[36m' GREEN=$'\033[32m' RED=$'\033[31m' RESET=$'\033[0m'
+else
+  BOLD= DIM= CYAN= GREEN= RED= RESET=
+fi
+STATUS=
+
+clear_screen() { [[ -t 1 ]] && printf '\033[H\033[2J' || true; }
+
+header() {
+  clear_screen
+  printf '%sODBC DSN manager%s  %sdriver: %s · %s%s\n\n' "$BOLD" "$RESET" "$DIM" "$DRIVER_NAME" "$INI" "$RESET"
+  cmd_list 2>&1 | sed 's/^/  /'
+  echo
+  if [[ -n $STATUS ]]; then printf '%s\n\n' "$STATUS"; STATUS=; fi
+}
+
+# menu_select <title> <option>... ; sets CHOICE to the index, or -1 to go back.
+menu_select() {
+  local title=$1; shift
+  local options=("$@") pos=0 key rest i
+  while :; do
+    header
+    printf '%s%s%s\n' "$BOLD" "$title" "$RESET"
+    for i in "${!options[@]}"; do
+      if (( i == pos )); then printf '  %s› %s%s\n' "$CYAN" "${options[$i]}" "$RESET"
+      else printf '    %s\n' "${options[$i]}"; fi
+    done
+    printf '\n%s↑/↓ move · enter select · q back%s\n' "$DIM" "$RESET"
+    IFS= read -rsn1 key || { CHOICE=-1; return; }
+    case $key in
+      $'\033')
+        IFS= read -rsn2 -t 1 rest || rest=
+        case $rest in
+          '[A') (( pos > 0 )) && pos=$((pos - 1)) ;;
+          '[B') (( pos < ${#options[@]} - 1 )) && pos=$((pos + 1)) ;;
+          '') CHOICE=-1; return ;;
+        esac ;;
+      k) (( pos > 0 )) && pos=$((pos - 1)) ;;
+      j) (( pos < ${#options[@]} - 1 )) && pos=$((pos + 1)) ;;
+      q|Q) CHOICE=-1; return ;;
+      '') CHOICE=$pos; return ;;
+    esac
+  done
+}
+
+# ask <label> [default] ; sets ANSWER. Fails on end of input.
+ask() {
+  local label=$1 default=${2:-}
+  if [[ -n $default ]]; then printf '  %s [%s]: ' "$label" "$default" >&2
+  else printf '  %s: ' "$label" >&2; fi
+  IFS= read -r ANSWER || return 1
+  [[ -n $ANSWER ]] || ANSWER=$default
+}
+
+ask_secret() {
+  printf '  %s: ' "$1" >&2
+  IFS= read -rs ANSWER || return 1
+  echo >&2
+}
+
+# pick_dsn <title> ; sets PICKED, fails when the user goes back.
+pick_dsn() {
+  local names=() name
+  while IFS= read -r name; do names+=("$name"); done < <(ini_sections)
+  if (( ${#names[@]} == 0 )); then STATUS="${RED}There are no DSNs yet.${RESET}"; return 1; fi
+  menu_select "$1" "${names[@]}" "Back"
+  (( CHOICE >= 0 && CHOICE < ${#names[@]} )) || return 1
+  PICKED=${names[$CHOICE]}
+}
+
+# run_into_status <command...> ; shows its output, green on success.
+run_into_status() {
+  local out
+  if out=$("$@" 2>&1); then STATUS="${GREEN}${out}${RESET}"
+  else STATUS="${RED}${out}${RESET}"; fi
+}
+
+menu_add() {
+  local name host port db user pass sslmode
+  header; printf '%sAdd DSN%s\n' "$BOLD" "$RESET"
+  ask "DSN name" || return 0; name=$ANSWER
+  ask "Host" || return 0; host=$ANSWER
+  ask "Port" "$DEFAULT_PORT" || return 0; port=$ANSWER
+  ask "Database" || return 0; db=$ANSWER
+  ask "User" || return 0; user=$ANSWER
+  ask_secret "Password" || return 0; pass=$ANSWER
+  ask "SSL mode" "$DEFAULT_SSLMODE" || return 0; sslmode=$ANSWER
+  ODBC_DSN_PASSWORD=$pass run_into_status cmd_add "$name" --host "$host" --port "$port" \
+    --database "$db" --user "$user" --sslmode "$sslmode"
+}
+
+menu_edit() {
+  local name args=() pass
+  pick_dsn "Edit which DSN?" || return 0
+  name=$PICKED
+  header; printf '%sEdit %s%s  %s(enter keeps the current value)%s\n' "$BOLD" "$name" "$RESET" "$DIM" "$RESET"
+  ask "Host" "$(ini_get "$name" Servername)" || return 0; args+=(--host "$ANSWER")
+  ask "Port" "$(ini_get "$name" Port)" || return 0; args+=(--port "$ANSWER")
+  ask "Database" "$(ini_get "$name" Database)" || return 0; args+=(--database "$ANSWER")
+  ask "User" "$(ini_get "$name" Username)" || return 0; args+=(--user "$ANSWER")
+  ask "SSL mode" "$(ini_get "$name" SSLmode)" || return 0; args+=(--sslmode "$ANSWER")
+  ask "Charset" "$(ini_get "$name" AnsiCharset)" || return 0; args+=(--charset "$ANSWER")
+  ask_secret "Password (enter keeps it)" || return 0; pass=$ANSWER
+  if [[ -n $pass ]]; then
+    ODBC_DSN_PASSWORD=$pass run_into_status cmd_edit "$name" "${args[@]}" --password
+  else
+    run_into_status cmd_edit "$name" "${args[@]}"
+  fi
+}
+
+menu_test() {
+  pick_dsn "Test which DSN?" || return 0
+  header; echo "  Connecting to '$PICKED'..."
+  run_into_status cmd_test "$PICKED"
+}
+
+menu_rename() {
+  local old
+  pick_dsn "Rename which DSN?" || return 0
+  old=$PICKED
+  header; printf '%sRename %s%s\n' "$BOLD" "$old" "$RESET"
+  ask "New name" || return 0
+  run_into_status cmd_rename "$old" "$ANSWER"
+}
+
+menu_rm() {
+  pick_dsn "Delete which DSN?" || return 0
+  header
+  ask "Delete '$PICKED'? Type its name to confirm" || return 0
+  if [[ $ANSWER == "$PICKED" ]]; then run_into_status cmd_rm "$PICKED" --yes
+  else STATUS="Cancelled"; fi
+}
+
+interactive() {
+  while :; do
+    menu_select "What do you want to do?" "Add DSN" "Edit DSN" "Test connection" \
+      "Rename DSN" "Delete DSN" "Quit"
+    case $CHOICE in
+      0) menu_add ;;
+      1) menu_edit ;;
+      2) menu_test ;;
+      3) menu_rename ;;
+      4) menu_rm ;;
+      *) clear_screen; return 0 ;;
+    esac
+  done
+}
+
+usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; }
+
+case ${1:-} in
+  '') interactive ;;
+  list) cmd_list ;;
+  show) shift; cmd_show "$@" ;;
+  add) shift; cmd_add "$@" ;;
+  edit) shift; cmd_edit "$@" ;;
+  rename) shift; cmd_rename "$@" ;;
+  rm|delete) shift; cmd_rm "$@" ;;
+  test) shift; cmd_test "$@" ;;
+  -h|--help|help) usage ;;
+  *) err "Unknown command: $1"; usage >&2; exit 1 ;;
+esac

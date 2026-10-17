@@ -39,8 +39,36 @@ sudo bash scripts/install-bundle.sh   # install /Library/ODBC/psqlodbc.bundle
 `install-bundle.sh` keeps the previous bundle and `/Library/ODBC/odbc.ini` as
 `*.bak-<timestamp>` and prints the rollback command.
 
-Then configure the DSN Excel will use, and quit Excel with Cmd+Q so it reloads
-the driver:
+Then create the DSN Excel will use, and quit Excel with Cmd+Q so it reloads
+the driver.
+
+## Managing DSNs
+
+`scripts/odbc-dsn` creates, edits, tests, renames and deletes DSNs for this
+driver. Run it without arguments for an interactive menu (arrow keys, Enter,
+`q` to go back), or use a subcommand:
+
+```sh
+scripts/odbc-dsn                       # interactive menu
+scripts/odbc-dsn list
+scripts/odbc-dsn add erp --host 10.0.0.9 --database erp --user bob   # asks the password
+scripts/odbc-dsn test erp              # connects through Excel's iODBC
+scripts/odbc-dsn edit erp --port 6543 --password
+scripts/odbc-dsn rename erp erp_prod
+scripts/odbc-dsn rm erp_prod
+```
+
+- New DSNs get `Port = 5432`, `SSLmode = disable` and `AnsiCharset = MACINTOSH`
+  unless told otherwise.
+- Passwords are typed hidden, or read from `ODBC_DSN_PASSWORD`, and are never
+  printed (`show` masks them).
+- Every change backs up `odbc.ini` as `odbc.ini.bak-<timestamp>` and rewrites
+  the file in place, so the hard link Excel reads (see below) stays intact.
+  The file is set to mode 600 because it holds passwords.
+- After a rename, Excel workbooks connected to the old name must be pointed
+  at the new one.
+
+A DSN written by hand looks like this:
 
 ```ini
 [PSQL]
@@ -97,8 +125,10 @@ DSNs in `/Library/ODBC/odbc.ini`.
 
 ```
 patches/   psqlodbc-ansi-charset.patch: the only change to upstream (5 files)
-scripts/   build-driver.sh, install-bundle.sh, export-csv.sh (CSV via psql, no ODBC)
+scripts/   odbc-dsn (DSN manager), build-driver.sh, install-bundle.sh,
+           export-csv.sh (CSV via psql, no ODBC)
 tests/     test-driver.py: checks the driver through Excel's iODBC framework
+           test-odbc-dsn.sh: odbc-dsn against a scratch, hard-linked odbc.ini
 tools/     probe-iodbc.py (iODBC ctypes harness), logdlsym.c (dlsym interposer)
 attic/     approaches that were tried and abandoned, kept for reference
 build/     generated: downloaded source and build output (not tracked)
