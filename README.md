@@ -45,8 +45,16 @@ the driver.
 ## Managing DSNs
 
 `scripts/odbc-dsn` creates, edits, tests, renames and deletes DSNs for this
-driver. Run it without arguments for an interactive menu (arrow keys, Enter,
-`q` to go back), or use a subcommand:
+driver. Run it without arguments for an interactive menu, or use a
+subcommand. Every menu shows the same controls:
+
+```
+↑↓  |  Enter  |  M More  |  V Version  |  Q Quit
+```
+
+`M` shows the command reference and `V` the tool and driver versions; both
+return to the menu on any key. In sub-menus (picking a DSN) `Q` goes back,
+and the footer says `Q Back`.
 
 ```sh
 scripts/odbc-dsn                       # interactive menu

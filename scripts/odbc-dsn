@@ -12,6 +12,7 @@
 #   odbc-dsn rename <old> <new>
 #   odbc-dsn rm     <name> [--yes]
 #   odbc-dsn test   <name>
+#   odbc-dsn --version
 #
 # Passwords are read hidden from the terminal, or from ODBC_DSN_PASSWORD.
 #
@@ -20,6 +21,9 @@
 # write rewrites the same file in place (never a rename) and a timestamped
 # backup is taken first.
 set -euo pipefail
+
+VERSION=0.1.0
+DRIVER_VERSION="psqlodbc 18.00.0005 (libiodbc build, AnsiCharset patch)"
 
 INI=${ODBC_DSN_INI:-$HOME/Library/ODBC/odbc.ini}
 DRIVER=/Library/ODBC/psqlodbc.bundle/Contents/MacOS/psqlodbcw.so
@@ -353,9 +357,33 @@ header() {
   if [[ -n $STATUS ]]; then printf '%s\n\n' "$STATUS"; STATUS=; fi
 }
 
-# menu_select <title> <option>... ; sets CHOICE to the index, or -1 to go back.
+version_line() { echo "odbc-dsn $VERSION"; }
+
+# Full-screen page (help or version) that returns on any key.
+show_page() {
+  clear_screen
+  "$@"
+  printf '\n%sPress any key to return%s\n' "$DIM" "$RESET"
+  IFS= read -rsn1 _ || true
+}
+
+page_version() {
+  printf '%s%s%s\n\n' "$BOLD" "$(version_line)" "$RESET"
+  printf '  Driver   %s\n' "$DRIVER_VERSION"
+  if [[ -f $DRIVER ]]; then printf '           %s\n' "$DRIVER"
+  else printf '           %snot installed at %s%s\n' "$RED" "$DRIVER" "$RESET"; fi
+  printf '  DSNs     %s\n' "$INI"
+}
+
+page_more() {
+  printf '%sodbc-dsn commands%s\n\n' "$BOLD" "$RESET"
+  usage
+}
+
+# menu_select <back label> <title> <option>... ; sets CHOICE to the index, or
+# -1 when the user presses q. The footer is the same on every menu.
 menu_select() {
-  local title=$1; shift
+  local back=$1 title=$2; shift 2
   local options=("$@") pos=0 key rest i
   while :; do
     header
@@ -364,7 +392,7 @@ menu_select() {
       if (( i == pos )); then printf '  %s› %s%s\n' "$CYAN" "${options[$i]}" "$RESET"
       else printf '    %s\n' "${options[$i]}"; fi
     done
-    printf '\n%s↑/↓ move · enter select · q back%s\n' "$DIM" "$RESET"
+    printf '\n%s↑↓  |  Enter  |  M More  |  V Version  |  Q %s%s\n' "$DIM" "$back" "$RESET"
     IFS= read -rsn1 key || { CHOICE=-1; return; }
     case $key in
       $'\033')
@@ -376,6 +404,8 @@ menu_select() {
         esac ;;
       k) (( pos > 0 )) && pos=$((pos - 1)) ;;
       j) (( pos < ${#options[@]} - 1 )) && pos=$((pos + 1)) ;;
+      m|M) show_page page_more ;;
+      v|V) show_page page_version ;;
       q|Q) CHOICE=-1; return ;;
       '') CHOICE=$pos; return ;;
     esac
@@ -402,7 +432,7 @@ pick_dsn() {
   local names=() name
   while IFS= read -r name; do names+=("$name"); done < <(ini_sections)
   if (( ${#names[@]} == 0 )); then STATUS="${RED}There are no DSNs yet.${RESET}"; return 1; fi
-  menu_select "$1" "${names[@]}" "Back"
+  menu_select Back "$1" "${names[@]}" "Back"
   (( CHOICE >= 0 && CHOICE < ${#names[@]} )) || return 1
   PICKED=${names[$CHOICE]}
 }
@@ -472,7 +502,7 @@ menu_rm() {
 
 interactive() {
   while :; do
-    menu_select "What do you want to do?" "Add DSN" "Edit DSN" "Test connection" \
+    menu_select Quit "What do you want to do?" "Add DSN" "Edit DSN" "Test connection" \
       "Rename DSN" "Delete DSN" "Quit"
     case $CHOICE in
       0) menu_add ;;
@@ -485,7 +515,8 @@ interactive() {
   done
 }
 
-usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; }
+# The header comment block (after the shebang) is the help text.
+usage() { awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"; }
 
 case ${1:-} in
   '') interactive ;;
@@ -497,5 +528,6 @@ case ${1:-} in
   rm|delete) shift; cmd_rm "$@" ;;
   test) shift; cmd_test "$@" ;;
   -h|--help|help) usage ;;
+  -V|--version|version) version_line ;;
   *) err "Unknown command: $1"; usage >&2; exit 1 ;;
 esac

@@ -150,6 +150,27 @@ ini_has "menu add password" "Password = menupass"
 not_contains "menu never echoes password" "menupass"
 linked "menu add"
 
+echo "== navigation footer, more and version"
+reset_ini
+OUT=$(printf 'q' | "$TOOL" 2>&1)
+contains "main footer" "↑↓  |  Enter  |  M More  |  V Version  |  Q Quit"
+# Down to "Edit DSN", Enter opens the DSN picker, q goes back, q quits.
+OUT=$(printf '\033[B\nqq' | "$TOOL" 2>&1); [[ $? -eq 0 ]] && ok "submenu back then quit" || fail "submenu exit" "$OUT"
+contains "submenu title" "Edit which DSN?"
+contains "submenu footer" "↑↓  |  Enter  |  M More  |  V Version  |  Q Back"
+OUT=$(printf 'vxq' | "$TOOL" 2>&1); [[ $? -eq 0 ]] && ok "version returns to menu" || fail "version exit" "$OUT"
+contains "version screen" "odbc-dsn $("$TOOL" --version | awk '{print $2}')"
+contains "version shows driver" "psqlodbc 18.00.0005"
+OUT=$(printf 'Mxq' | "$TOOL" 2>&1); [[ $? -eq 0 ]] && ok "more returns to menu" || fail "more exit" "$OUT"
+contains "more shows commands" "odbc-dsn rename <old> <new>"
+assert "--help" 0 "$TOOL" --help
+contains "help is complete" "backup is taken first."
+not_contains "help stops at the code" "set -euo pipefail"
+OUT=$(printf '\033[B\nvxqq' | "$TOOL" 2>&1); [[ $? -eq 0 ]] && ok "version from submenu" || fail "submenu version exit" "$OUT"
+contains "version inside submenu" "psqlodbc 18.00.0005"
+assert "--version" 0 "$TOOL" --version
+[[ $OUT =~ ^odbc-dsn\ [0-9]+\.[0-9]+\.[0-9]+$ ]] && ok "--version format" || fail "--version format" "$OUT"
+
 echo
 echo "passed: $PASS  failed: $FAIL"
 [[ $FAIL -eq 0 ]]
