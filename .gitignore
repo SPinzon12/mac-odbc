@@ -13,3 +13,7 @@ __pycache__/
 
 # Local agent tooling
 .atl/
+
+# Local credentials and backups
+.env*
+*.ini.bak*

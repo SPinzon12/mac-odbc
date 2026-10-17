@@ -126,6 +126,22 @@ DSNs in `/Library/ODBC/odbc.ini`.
 - The key is read from the DSN when connecting, so it does not apply to
   DSN-less connection strings.
 
+## Removing the Actual drivers
+
+```sh
+bash scripts/uninstall-actual.sh --dry-run   # preview
+sudo bash scripts/uninstall-actual.sh        # shows the plan, asks "yes"
+```
+
+It removes the four `Actual *.bundle` drivers, ODBC Manager, their
+`odbcinst.ini` entries, any DSN that uses them, and their installer receipts.
+It also points `[psql]` in `/Library/ODBC/odbcinst.ini` at the bundle.
+
+It **keeps** `/Library/Frameworks/iODBC.framework` and `iODBCinst.framework`.
+Actual's installer is their only source on macOS, and Excel loads
+`iODBC.framework` by name for every ODBC connection, so removing them breaks
+this driver too.
+
 ## Known limitations
 
 - Column **names** and SQL text typed in Excel take iODBC's ANSI-to-Unicode
