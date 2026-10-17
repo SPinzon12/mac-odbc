@@ -52,6 +52,12 @@ subcommand. Every menu shows the same controls:
 ↑↓  |  Enter  |  M More  |  V Version  |  Q Quit
 ```
 
+To run it from any folder as `odbc-dsn`, link it into your `PATH`:
+
+```sh
+ln -s "$PWD/scripts/odbc-dsn" /opt/homebrew/bin/odbc-dsn
+```
+
 `M` shows the command reference and `V` the tool and driver versions; both
 return to the menu on any key. In sub-menus (picking a DSN) `Q` goes back,
 and the footer says `Q Back`.
