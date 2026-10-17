@@ -1,0 +1,12 @@
+# Generated: downloaded upstream source and build output
+build/
+
+# Compiled artifacts (sources are tracked; attic binaries stay local only)
+*.so
+*.dylib
+*.o
+attic/probes/probe-iodbc
+attic/probes/probe-w
+
+.DS_Store
+__pycache__/

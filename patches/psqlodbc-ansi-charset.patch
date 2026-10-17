@@ -1,0 +1,252 @@
+--- a/win_unicode.c	2026-10-12 12:08:37
++++ b/win_unicode.c	2026-10-16 18:32:43
+@@ -10,8 +10,14 @@
+ #ifdef	UNICODE_SUPPORT
+ 
+ #include "unicode_support.h"
++#include "misc.h"
++#include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#ifndef	WIN32
++#include <errno.h>
++#include <iconv.h>
++#endif /* WIN32 */
+ #include <ctype.h>
+ #include <limits.h>
+ 
+@@ -1320,5 +1326,117 @@
+ 		l = bindcol_localize_exec(ldt, n, lf_conv, &tmpbuf);
+ 
+ 	return l;
++}
++
++/*
++ *	SQL_C_CHAR charset override (non-Windows).
++ *
++ *	Some ANSI applications decode SQL_C_CHAR data with a fixed legacy
++ *	charset instead of UTF-8 (Excel for Mac uses Mac Roman). PostgreSQL has
++ *	no such client encoding and macOS has no such locale, so the conversion
++ *	is done here with iconv when the DSN sets AnsiCharset.
++ */
++static char	ansi_charset[64];
++
++void set_ansi_charset(const char *charset)
++{
++	if (charset)
++		strncpy_null(ansi_charset, charset, sizeof(ansi_charset));
++	else
++		ansi_charset[0] = '\0';
++#ifndef	WIN32
++	/* an unknown charset name is ignored rather than failing every row */
++	if (ansi_charset_active())
++	{
++		iconv_t	cd = iconv_open(ansi_charset, "UTF-8");
++
++		if ((iconv_t) -1 == cd)
++		{
++			MYLOG(0, "unknown ansi charset \"%s\" ignored\n", ansi_charset);
++			ansi_charset[0] = '\0';
++		}
++		else
++			iconv_close(cd);
++	}
++#else
++	ansi_charset[0] = '\0';
++#endif /* WIN32 */
++	MYLOG(0, "ansi charset=\"%s\"\n", ansi_charset);
++}
++
++BOOL ansi_charset_active(void)
++{
++	return '\0' != ansi_charset[0];
++}
++
++#ifndef	WIN32
++static size_t utf8_seq_len(UCHAR lead)
++{
++	if (lead < 0x80)
++		return 1;
++	if (0xc0 == (lead & 0xe0))
++		return 2;
++	if (0xe0 == (lead & 0xf0))
++		return 3;
++	if (0xf0 == (lead & 0xf8))
++		return 4;
++	return 1;
+ }
++#endif /* WIN32 */
++
++/*
++ *	Returns a malloc'ed copy of utf8str converted to the AnsiCharset, or
++ *	NULL on failure. Characters the charset lacks become '?': //TRANSLIT is
++ *	requested, but the BSD iconv in macOS ignores it and stops instead.
++ */
++char *utf8_to_ansi_charset(const char *utf8str)
++{
++#ifdef	WIN32
++	return NULL;
++#else
++	char	tocode[sizeof(ansi_charset) + 16];
++	size_t	inleft = strlen(utf8str), outcap = inleft * 4 + 1, outleft, skip;
++	char	*in = (char *) utf8str, *out, *outbuf;
++	iconv_t	cd;
++
++	snprintf(tocode, sizeof(tocode), "%s//TRANSLIT", ansi_charset);
++	if ((iconv_t) -1 == (cd = iconv_open(tocode, "UTF-8")) &&
++	    (iconv_t) -1 == (cd = iconv_open(ansi_charset, "UTF-8")))
++	{
++		MYLOG(0, "iconv_open(%s) failed\n", ansi_charset);
++		return NULL;
++	}
++	if (NULL == (outbuf = malloc(outcap)))
++	{
++		iconv_close(cd);
++		return NULL;
++	}
++	out = outbuf;
++	outleft = outcap - 1;
++	while (inleft > 0)
++	{
++		if ((size_t) -1 != iconv(cd, &in, &inleft, &out, &outleft))
++			break;
++		if ((EILSEQ != errno && EINVAL != errno) || outleft < 1)
++		{
++			MYLOG(0, "iconv to %s failed at byte " FORMAT_SIZE_T "\n", ansi_charset, (size_t) (in - utf8str));
++			free(outbuf);
++			iconv_close(cd);
++			return NULL;
++		}
++		/* not representable (or truncated input): substitute and move on */
++		*out++ = '?';
++		outleft--;
++		skip = utf8_seq_len((UCHAR) *in);
++		if (skip > inleft)
++			skip = inleft;
++		in += skip;
++		inleft -= skip;
++		iconv(cd, NULL, NULL, NULL, NULL);
++	}
++	*out = '\0';
++	iconv_close(cd);
++	return outbuf;
++#endif /* WIN32 */
++}
+ #endif	/* UNICODE_SUPPORT */
+--- a/convert.c	2026-10-12 12:08:37
++++ b/convert.c	2026-10-16 18:31:25
+@@ -993,6 +993,7 @@
+ 	int	unicode_count = -1;
+ 	BOOL	localize_needed = FALSE;
+ 	BOOL	hybrid = FALSE;
++	char	*charset_buf = NULL;
+ #endif /* UNICODE_SUPPORT */
+ 
+ 	if (PG_TYPE_BYTEA == field_type)
+@@ -1006,8 +1007,32 @@
+ 	}
+ 
+ #ifdef	UNICODE_SUPPORT
+-	if (0 == bytea_process_kind)
++	/*
++	 * AnsiCharset: hand SQL_C_CHAR text over in the configured charset. The
++	 * converted copy replaces neut_str, so it must always be copied into
++	 * ttlbuf below (ptr may not point at charset_buf, which is freed here).
++	 */
++	if (0 == bytea_process_kind && SQL_C_CHAR == fCType && ansi_charset_active())
+ 	{
++		switch (field_type)
++		{
++			case PG_TYPE_UNKNOWN:
++			case PG_TYPE_BPCHAR:
++			case PG_TYPE_VARCHAR:
++			case PG_TYPE_TEXT:
++			case PG_TYPE_BPCHARARRAY:
++			case PG_TYPE_VARCHARARRAY:
++			case PG_TYPE_TEXTARRAY:
++				if (NULL == (charset_buf = utf8_to_ansi_charset(neut_str)))
++				{
++					result = COPY_INVALID_STRING_CONVERSION;
++					goto cleanup;
++				}
++				neut_str = charset_buf;
++		}
++	}
++	if (0 == bytea_process_kind && NULL == charset_buf)
++	{
+ 		if (get_convtype() > 0) /* conversion between the current locale is available */
+ 		{
+ 			BOOL	wcs_debug = conn->connInfo.wcs_debug;
+@@ -1094,6 +1119,10 @@
+ 		 */
+ 		len_for_wcs_term = 1;
+ 	}
++#ifdef	UNICODE_SUPPORT
++	if (charset_buf)
++		changed = TRUE;
++#endif /* UNICODE_SUPPORT */
+ 	if (changed || needbuflen + len_for_wcs_term > cbValueMax)
+ 	{
+ 		if (needbuflen + len_for_wcs_term > (SQLLEN) pgdc->ttlbuflen)
+@@ -1164,6 +1193,8 @@
+ #ifdef	UNICODE_SUPPORT
+ 	if (allocbuf)
+ 		free(allocbuf);
++	if (charset_buf)
++		free(charset_buf);
+ #endif /* UNICODE_SUPPORT */
+ 
+ 	*length_return = len;
+--- a/connection.c	2026-10-12 12:08:37
++++ b/connection.c	2026-10-16 18:31:11
+@@ -42,6 +42,9 @@
+ #include "loadlib.h"
+ 
+ #include "multibyte.h"
++#ifdef UNICODE_SUPPORT
++#include "unicode_support.h"
++#endif /* UNICODE_SUPPORT */
+ 
+ #include "pgapifunc.h"
+ 
+@@ -1194,6 +1197,13 @@
+ 	CC_clear_error(self);
+ 	CC_determine_locale_encoding(self); /* determine the locale_encoding */
+ #ifdef UNICODE_SUPPORT
++	{
++		char	charset[64] = "";
++
++		if ('\0' != self->connInfo.dsn[0])
++			SQLGetPrivateProfileString(self->connInfo.dsn, INI_ANSI_CHARSET, "", charset, sizeof(charset), ODBC_INI);
++		set_ansi_charset(charset);
++	}
+ 	if (CC_is_in_unicode_driver(self))
+ 	{
+ 		if (!SQL_SUCCEEDED(CC_send_client_encoding(self, "UTF8")))
+--- a/unicode_support.h	2026-10-12 12:08:37
++++ b/unicode_support.h	2026-10-16 18:30:43
+@@ -33,6 +33,14 @@
+ 
+ SQLLEN locale_to_sqlwchar(SQLWCHAR *utf16, const char *ldt, size_t n, BOOL lf_conv);
+ SQLLEN utf8_to_locale(char *ldt, const char * utf8dt, size_t n, BOOL lf_conv);
++
++/*
++ * Optional charset (iconv name, e.g. "MACINTOSH") for SQL_C_CHAR text
++ * returned by the unicode driver. Set from the DSN's AnsiCharset key.
++ */
++void	set_ansi_charset(const char *charset);
++BOOL	ansi_charset_active(void);
++char	*utf8_to_ansi_charset(const char *utf8str);
+ #endif /* UNICODE_SUPPORT */
+ 
+ #endif /* __UNICODE_SUPPORT_H__ */
+--- a/dlg_specific.h	2026-10-12 12:08:37
++++ b/dlg_specific.h	2026-10-16 18:31:04
+@@ -160,6 +160,7 @@
+ #define ABBR_SSLMODE			"CA"
+ #define INI_EXTRAOPTIONS		"AB"
+ #define INI_LOGDIR			"Logdir"
++#define INI_ANSI_CHARSET		"AnsiCharset"	/* iconv charset for SQL_C_CHAR text */
+ #define INI_KEEPALIVETIME		"KeepaliveTime"
+ #define ABBR_KEEPALIVETIME		"D1"
+ #define INI_KEEPALIVEINTERVAL		"KeepaliveInterval"
